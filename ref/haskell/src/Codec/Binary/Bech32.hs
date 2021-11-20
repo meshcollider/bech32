@@ -20,9 +20,16 @@ import Data.Foldable (foldl')
 import Data.Functor.Identity (Identity, runIdentity)
 import Data.Ix (Ix(..))
 import Data.Word (Word8)
+import Data.Maybe (listToMaybe)
 
 type HRP = BS.ByteString
 type Data = [Word8]
+
+data EncodingType = BECH32 | BECH32M deriving (Eq)
+
+getEncodingConstant :: EncodingType -> Word
+getEncodingConstant BECH32 = 1
+getEncodingConstant BECH32M = 0x2bc830a3
 
 (.>>.), (.<<.) :: Bits a => a -> Int -> a
 (.>>.) = unsafeShiftR
@@ -68,19 +75,19 @@ bech32Polymod values = foldl' go 1 values .&. 0x3fffffff
 bech32HRPExpand :: HRP -> [Word5]
 bech32HRPExpand hrp = map (UnsafeWord5 . (.>>. 5)) (BS.unpack hrp) ++ [UnsafeWord5 0] ++ map word5 (BS.unpack hrp)
 
-bech32CreateChecksum :: HRP -> [Word5] -> [Word5]
-bech32CreateChecksum hrp dat = [word5 (polymod .>>. i) | i <- [25,20..0]]
+bech32CreateChecksum :: HRP -> [Word5] -> EncodingType -> [Word5]
+bech32CreateChecksum hrp dat enc = [word5 (polymod .>>. i) | i <- [25,20..0]]
   where
     values = bech32HRPExpand hrp ++ dat
-    polymod = bech32Polymod (values ++ map UnsafeWord5 [0, 0, 0, 0, 0, 0]) `xor` 1
+    polymod = bech32Polymod (values ++ map UnsafeWord5 [0, 0, 0, 0, 0, 0]) `xor` getEncodingConstant enc
 
-bech32VerifyChecksum :: HRP -> [Word5] -> Bool
-bech32VerifyChecksum hrp dat = bech32Polymod (bech32HRPExpand hrp ++ dat) == 1
+bech32VerifyChecksum :: HRP -> [Word5] -> EncodingType -> Bool
+bech32VerifyChecksum hrp dat enc = bech32Polymod (bech32HRPExpand hrp ++ dat) == getEncodingConstant enc
 
-bech32Encode :: HRP -> [Word5] -> Maybe BS.ByteString
-bech32Encode hrp dat = do
+bech32Encode :: HRP -> [Word5] -> EncodingType -> Maybe BS.ByteString
+bech32Encode hrp dat enc = do
     guard $ checkHRP hrp
-    let dat' = dat ++ bech32CreateChecksum hrp dat
+    let dat' = dat ++ bech32CreateChecksum hrp dat enc
         rest = map (charset Arr.!) dat'
         result = BSC.concat [BSC.map toLower hrp, BSC.pack "1", BSC.pack rest]
     guard $ BS.length result <= 90
@@ -89,7 +96,7 @@ bech32Encode hrp dat = do
 checkHRP :: BS.ByteString -> Bool
 checkHRP hrp = not (BS.null hrp) && BS.all (\char -> char >= 33 && char <= 126) hrp
 
-bech32Decode :: BS.ByteString -> Maybe (HRP, [Word5])
+bech32Decode :: BS.ByteString -> Maybe (HRP, [Word5], EncodingType)
 bech32Decode bech32 = do
     guard $ BS.length bech32 <= 90
     guard $ BSC.map toUpper bech32 == bech32 || BSC.map toLower bech32 == bech32
@@ -98,8 +105,7 @@ bech32Decode bech32 = do
     hrp' <- BSC.stripSuffix (BSC.pack "1") hrp
     guard $ checkHRP hrp'
     dat' <- mapM charsetMap $ BSC.unpack dat
-    guard $ bech32VerifyChecksum hrp' dat'
-    return (hrp', take (BS.length dat - 6) dat')
+    listToMaybe $ [ (hrp', take (BS.length dat - 6) dat', enc') | enc' <- [BECH32, BECH32M], bech32VerifyChecksum hrp' dat' enc' ]
 
 type Pad f = Int -> Int -> Word -> [[Word]] -> f [[Word]]
 
@@ -137,23 +143,24 @@ toBase32 dat = map word5 $ runIdentity $ convertBits (map fromIntegral dat) 8 5 
 toBase256 :: [Word5] -> Maybe [Word8]
 toBase256 dat = fmap (map fromIntegral) $ convertBits (map fromWord5 dat) 5 8 noPadding
 
-segwitCheck :: Word8 -> Data -> Bool
-segwitCheck witver witprog =
+segwitCheck :: Word8 -> Data -> EncodingType -> Bool
+segwitCheck witver witprog enc =
     witver <= 16 &&
     if witver == 0
-    then length witprog == 20 || length witprog == 32
-    else length witprog >= 2 && length witprog <= 40
+    then (length witprog == 20 || length witprog == 32) && enc == BECH32
+    else (length witprog >= 2 && length witprog <= 40) && enc == BECH32M
 
 segwitDecode :: HRP -> BS.ByteString -> Maybe (Word8, Data)
 segwitDecode hrp addr = do
-    (hrp', dat) <- bech32Decode addr
+    (hrp', dat, enc) <- bech32Decode addr
     guard $ (hrp == hrp') && not (null dat)
     let (UnsafeWord5 witver : datBase32) = dat
     decoded <- toBase256 datBase32
-    guard $ segwitCheck witver decoded
+    guard $ segwitCheck witver decoded enc
     return (witver, decoded)
 
 segwitEncode :: HRP -> Word8 -> Data -> Maybe BS.ByteString
 segwitEncode hrp witver witprog = do
-    guard $ segwitCheck witver witprog
-    bech32Encode hrp $ UnsafeWord5 witver : toBase32 witprog
+    guard $ segwitCheck witver witprog enc
+    bech32Encode hrp (UnsafeWord5 witver : toBase32 witprog) enc
+        where enc = if witver == 0 then BECH32 else BECH32M
